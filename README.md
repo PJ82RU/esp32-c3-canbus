@@ -26,6 +26,32 @@ lib_deps =
     https://github.com/PJ82RU/esp32-c3-canbus.git
 ```
 
+## Быстрый старт
+
+```cpp
+#include "hardware_can.h"
+
+// Пины CAN (замените на актуальные для вашей платы)
+#define CAN_TX_PIN GPIO_NUM_5
+#define CAN_RX_PIN GPIO_NUM_6
+
+void setupCan() {
+    canbus::Can can(CAN_TX_PIN, CAN_RX_PIN);
+    
+    if(can.begin(nullptr)) { // Без callback
+        // Установка скорости (по умолчанию 125 кбит/с)
+        can.setSpeed(canbus::CanSpeed::SPEED_250KBIT);
+        
+        // Отправка тестового фрейма
+        canbus::CanFrame frame;
+        frame.id = 0x123;
+        frame.data.uint32[0] = 0xDEADBEEF;
+        frame.length = 4;
+        can.send(frame);
+    }
+}
+```
+
 ## Лицензия
 
 Данная библиотека распространяется как свободное и бесплатное программное обеспечение, переданное в общественное достояние.
