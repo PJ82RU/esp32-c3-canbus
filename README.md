@@ -23,59 +23,8 @@
 
 ```ini
 lib_deps =
-    https://github.com/PJ82RU/esp32-c3-canbus-arduino.git
+    https://github.com/PJ82RU/esp32-c3-canbus.git
 ```
-
-### Arduino IDE
-
-1. Скачайте ZIP из GitHub
-2. Скетч → Подключить библиотеку → Добавить .ZIP библиотеку
-
-## Быстрый старт
-
-```cpp
-#include "hardware/can.h"
-
-hardware::Can can(GPIO_NUM_5, GPIO_NUM_6);
-
-void setup() {
-    can.begin(nullptr); // Инициализация без callback
-    can.setSpeed(hardware::CanSpeed::SPEED_250KBIT);
-}
-
-void loop() {
-    hardware::CanFrame frame;
-    frame.id = 0x123;
-    frame.data.uint8[0] = 0xAA;
-    frame.length = 1;
-    
-    can.send(frame);
-    delay(1000);
-}
-```
-
-## Примеры
-
-1. `basic` - Базовая отправка/прием сообщений
-2. `advanced` - Использование фильтров и callback-ов
-
-## Документация
-
-### Класс `CanFrame`
-
-- `id` - Идентификатор сообщения (11/29 бит)
-- `data` - Полезная нагрузка (до 8 байт)
-- `length` - Длина данных (0-8)
-- `extended` - Флаг расширенного формата
-- `rtr` - Флаг удаленного запроса
-
-### Класс `Can`
-
-- `begin()` - Инициализация CAN-контроллера
-- `setSpeed()` - Установка скорости
-- `setFilter()` - Настройка фильтров
-- `send()` - Отправка сообщения
-- `receive()` - Получение сообщения
 
 ## Лицензия
 

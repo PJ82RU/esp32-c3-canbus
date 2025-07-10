@@ -1,7 +1,8 @@
-#ifndef HARDWARE_CAN_FRAME_H
-#define HARDWARE_CAN_FRAME_H
+#ifndef CANBUS_CAN_FRAME_H
+#define CANBUS_CAN_FRAME_H
 
-#include <Arduino.h>
+#include <cstddef>
+#include <cstdint>
 
 namespace canbus
 {
@@ -18,9 +19,20 @@ namespace canbus
     {
     public:
         /**
-         * @brief Оператор присваивания значения биту
+         * @brief Конструктор
+         * @param[in] ref Указатель на байт
+         * @param[in] pos Позиция бита в байте (0-7)
          */
-        BitRef& operator=(const bool x)
+        BitRef(uint8_t* ref, const int pos) noexcept : mRef(ref), mPos(pos)
+        {
+        }
+
+        /**
+         * @brief Оператор присваивания значения биту
+         * @param[in] x Значение для установки
+         * @return Ссылка на текущий объект
+         */
+        BitRef& operator=(const bool x) noexcept
         {
             *mRef = (*mRef & ~(1 << mPos));
             if (x) *mRef = *mRef | (1 << mPos);
@@ -29,19 +41,11 @@ namespace canbus
 
         /**
          * @brief Оператор приведения к bool
+         * @return Значение бита
          */
-        explicit operator bool() const
+        explicit operator bool() const noexcept
         {
             return (*mRef & (1 << mPos)) != 0;
-        }
-
-        /**
-         * @brief Конструктор
-         * @param ref Указатель на байт
-         * @param pos Позиция бита в байте (0-7)
-         */
-        BitRef(uint8_t* ref, const int pos) : mRef(ref), mPos(pos)
-        {
         }
 
     private:
@@ -73,20 +77,22 @@ namespace canbus
 
             /**
              * @brief Оператор чтения бита
+             * @param[in] pos Позиция бита (0-63)
+             * @return Значение бита
              */
-            bool operator[](const int pos) const
+            bool operator[](const int pos) const noexcept
             {
-                if (pos < 0 || pos > 63) return false;
-                return (field[pos / 8] >> (pos % 8)) & 1;
+                return (pos >= 0 && pos <= 63) ? (field[pos / 8] >> (pos % 8)) & 1 : false;
             }
 
             /**
              * @brief Оператор записи бита
+             * @param[in] pos Позиция бита (0-63)
+             * @return Ссылка на бит
              */
-            BitRef operator[](const int pos)
+            BitRef operator[](const int pos) noexcept
             {
-                if (pos < 0 || pos > 63) return {&field[0], 0};
-                return {&field[pos / 8], pos % 8};
+                return (pos >= 0 && pos <= 63) ? BitRef(&field[pos / 8], pos % 8) : BitRef(&field[0], 0);
             }
         } bit;
     };
@@ -97,8 +103,49 @@ namespace canbus
     class CanFrame
     {
     public:
+        /// @brief Тег для логирования
+        static constexpr auto TAG = "CANFrame";
+
+        /**
+         * @brief Конструктор по умолчанию
+         */
+        CanFrame() noexcept;
+
+        /**
+         * @brief Очистка фрейма
+         */
+        void clear() noexcept;
+
+        /**
+         * @brief Проверка наличия данных
+         * @return true если фрейм содержит данные
+         */
+        [[nodiscard]] bool hasData() const noexcept;
+
+        /**
+         * @brief Получение 16-битного значения
+         * @param[in] index Начальный индекс в массиве данных
+         * @return 16-битное значение
+         */
+        [[nodiscard]] uint16_t getWord(int index) const noexcept;
+
+        /**
+         * @brief Сравнение фреймов
+         * @param[in] frame Фрейм для сравнения
+         * @return true если фреймы идентичны
+         */
+        [[nodiscard]] bool compare(const CanFrame& frame) const noexcept;
+
+        /**
+         * @brief Получение байтов по битовым индексам
+         * @param[in] indexes Массив индексов битов
+         * @param[in] size Размер массива индексов
+         * @return Объединение с полученными данными
+         */
+        Bytes getBytes(const int indexes[], size_t size) noexcept;
+
         uint32_t id = 0;                     ///< 11- или 29-битный идентификатор
-        Bytes data;                          ///< Данные фрейма
+        Bytes data{};                        ///< Данные фрейма
         uint8_t length = 0;                  ///< Длина данных (0-8)
         uint32_t extended = 0;               ///< Флаг расширенного формата (29 бит)
         uint32_t rtr = 0;                    ///< Флаг удаленного запроса
@@ -106,44 +153,9 @@ namespace canbus
         uint16_t frequency = CAN_FRAME_FREQ; ///< Частота отправки (мс)
         unsigned long nextSendTime = 0;      ///< Время следующей отправки (мс)
 
-        /**
-         * @brief Конструктор
-         */
-        CanFrame();
-
-        /**
-         * @brief Очистка фрейма
-         */
-        void clear();
-
-        /**
-         * @brief Проверка наличия данных
-         * @return true если фрейм содержит данные
-         */
-        [[nodiscard]] bool hasData() const;
-
-        /**
-         * @brief Получение 16-битного значения
-         * @param index Начальный индекс в массиве данных
-         * @return 16-битное значение
-         */
-        [[nodiscard]] uint16_t getWord(int index) const;
-
-        /**
-         * @brief Сравнение фреймов
-         * @param frame Фрейм для сравнения
-         * @return true если фреймы идентичны
-         */
-        [[nodiscard]] bool compare(const CanFrame& frame) const;
-
-        /**
-         * @brief Получение байтов по битовым индексам
-         * @param indexes Массив индексов битов
-         * @param size Размер массива индексов
-         * @return Объединение с полученными данными
-         */
-        Bytes getBytes(const int indexes[], size_t size);
+    private:
+        // Приватные методы (если будут добавлены в будущем)
     };
-} // namespace hardware
+} // namespace canbus
 
-#endif // HARDWARE_CAN_FRAME_H
+#endif // CANBUS_CAN_FRAME_H

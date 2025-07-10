@@ -3,9 +3,11 @@
 
 #include "can_frame.h"
 #include "esp32_c3_objects/thread.h"
-#include "esp32_c3_objects/semaphore.h"
 #include "esp32_c3_objects/callback.h"
 #include "driver/twai.h"
+
+#include <mutex>
+#include <cstdint>
 
 namespace canbus
 {
@@ -37,11 +39,11 @@ namespace canbus
      */
     struct CanFilter
     {
-        bool configured = false;    ///< Флаг настройки фильтра
-        bool extended = false;      ///< Флаг расширенного формата
         uint32_t id = 0;            ///< Идентификатор
         uint32_t mask = 0;          ///< Маска
         int16_t callbackIndex = -1; ///< Индекс callback-функции
+        bool configured = false;    ///< Флаг настройки фильтра
+        bool extended = false;      ///< Флаг расширенного формата
     };
 
     /**
@@ -50,17 +52,20 @@ namespace canbus
     class Can
     {
     public:
+        /// @brief Тег для логирования
+        static constexpr auto TAG = "Can";
+
         /**
          * @brief Конструктор
          * @param txPin Пин TX
          * @param rxPin Пин RX
          */
-        Can(gpio_num_t txPin, gpio_num_t rxPin);
+        Can(gpio_num_t txPin, gpio_num_t rxPin) noexcept;
 
         /**
          * @brief Деструктор
          */
-        ~Can();
+        ~Can() noexcept;
 
         // Запрет копирования
         Can(const Can&) = delete;
@@ -71,31 +76,31 @@ namespace canbus
          * @param callback Функция обратного вызова
          * @return true если инициализация прошла успешно
          */
-        bool begin(esp32_c3_objects::Callback* callback);
+        bool begin(esp32_c3::objects::Callback* callback) noexcept;
 
         /**
          * @brief Деинициализация CAN-интерфейса
          */
-        void end();
+        void end() noexcept;
 
         /**
          * @brief Получить текущее состояние CAN-интерфейса
          * @return Состояние интерфейса
          */
-        twai_state_t getState() const;
+        twai_state_t getState() const noexcept;
 
         /**
          * @brief Ожидание перехода в рабочее состояние
          * @param timeout Таймаут ожидания (мс)
          * @return true если интерфейс в рабочем состоянии
          */
-        bool waitRunning(unsigned long timeout = 0) const;
+        bool waitRunning(uint32_t timeout = 0) const noexcept;
 
         /**
          * @brief Установка скорости CAN-шины
          * @param speed Скорость передачи
          */
-        void setSpeed(CanSpeed speed);
+        void setSpeed(CanSpeed speed) noexcept;
 
         /**
          * @brief Установка фильтра
@@ -106,7 +111,7 @@ namespace canbus
          * @param callbackIndex Индекс callback-функции
          * @return Индекс установленного фильтра или -1 при ошибке
          */
-        int setFilter(uint8_t index, uint32_t id, uint32_t mask, bool extended, int16_t callbackIndex = -1);
+        int8_t setFilter(uint8_t index, uint32_t id, uint32_t mask, bool extended, int16_t callbackIndex = -1) noexcept;
 
         /**
          * @brief Установка фильтра (автовыбор индекса)
@@ -116,106 +121,103 @@ namespace canbus
          * @param callbackIndex Индекс callback-функции
          * @return Индекс установленного фильтра или -1 при ошибке
          */
-        int setFilter(uint32_t id, uint32_t mask, bool extended, int16_t callbackIndex = -1);
+        int8_t setFilter(uint32_t id, uint32_t mask, bool extended, int16_t callbackIndex = -1) noexcept;
 
         /**
          * @brief Получить параметры фильтра
          * @param index Индекс фильтра
          * @return Структура с параметрами фильтра
          */
-        CanFilter getFilter(int16_t index) const;
+        CanFilter getFilter(int16_t index) const noexcept;
 
         /**
          * @brief Очистить все фильтры
          */
-        void clearFilters();
+        void clearFilters() noexcept;
 
         /**
          * @brief Отправить CAN-кадр
          * @param frame CAN-кадр для отправки
          * @return true если отправка прошла успешно
          */
-        bool send(CanFrame& frame) const;
+        bool send(CanFrame& frame) const noexcept;
 
         /**
          * @brief Получить CAN-кадр из буфера
          * @param frame CAN-кадр для заполнения
          * @return true если кадр получен
          */
-        bool receive(CanFrame& frame) const;
-
-        /**
-         * @brief Обработчик ответа
-         * @param value Указатель на данные
-         * @param params Указатель на параметры
-         */
-        static void onResponse(void* value, void* params);
+        bool receive(CanFrame& frame) const noexcept;
 
     protected:
         /**
-         * @brief Дружественная функция для задачи watchdog
+         * @brief Задача мониторинга состояния CAN-интерфейса (watchdog)
+         * @details Бесконечно проверяет состояние шины, инициирует восстановление
+         *          при переходе в состояние BUS_OFF
+         * @param params Указатель на экземпляр класса Can (this)
          */
-        friend void canWatchdogTask(void* params);
+        static void CanWatchdogTask(void* params);
 
         /**
-         * @brief Дружественная функция для задачи приема
+         * @brief Задача приема сообщений с CAN-шины
+         * @details Бесконечно обрабатывает входящие сообщения, применяя фильтрацию
+         *          и передавая данные через callback-механизм
+         * @param params Указатель на экземпляр класса Can (this)
          */
-        friend void canReceiveTask(void* params);
+        static void CanReceiveTask(void* params);
 
         /**
          * @brief Обработчик watchdog-таймера
          */
-        void handleWatchdog();
+        [[noreturn]] void handleWatchdog() noexcept;
 
         /**
          * @brief Обработчик приема сообщений
          * @return true если интерфейс готов к работе
          */
-        bool handleReceive() const;
+        [[noreturn]] void handleReceive() const noexcept;
 
     private:
         /**
          * @brief Установка и запуск драйвера TWAI
          * @return true если операция выполнена успешно
          */
-        bool installAndStartDriver();
+        bool installAndStartDriver() noexcept;
 
         /**
          * @brief Остановка и удаление драйвера TWAI
          */
-        void stopAndUninstallDriver();
+        void stopAndUninstallDriver() noexcept;
 
         /**
          * @brief Обработка входящего сообщения
          * @param message Входящее сообщение
          */
-        void processFrame(const twai_message_t& message) const;
+        void processFrame(const twai_message_t& message) const noexcept;
 
-        /// Поток для мониторинга состояния
-        esp32_c3_objects::Thread mWatchdogThread;
-        /// Поток для приема сообщений
-        esp32_c3_objects::Thread mReceiveThread;
-        /// Callback-механизм
-        esp32_c3_objects::Callback* mCallback = nullptr;
-        /// Семафор для синхронизации
-        esp32_c3_objects::Semaphore mSemaphore;
+        // Потоки
+        esp32_c3::objects::Thread mWatchdogThread; ///< Поток мониторинга состояния
+        esp32_c3::objects::Thread mReceiveThread;  ///< Поток приема сообщений
 
-        /// Текущая скорость
-        CanSpeed mSpeed = CanSpeed::SPEED_125KBIT;
-        /// Флаг готовности драйвера
-        bool mDriverReady = false;
-        /// Информация о состоянии
-        twai_status_info_t mStatusInfo = {};
-        /// Массив фильтров
-        CanFilter mFilters[CAN_NUM_FILTER];
+        // Примитивные типы
+        bool mDriverReady = false;                 ///< Флаг готовности драйвера
+        CanSpeed mSpeed = CanSpeed::SPEED_125KBIT; ///< Текущая скорость
 
-        /// Конфигурация драйвера
-        twai_general_config_t mDriverConfig = {};
-        /// Конфигурация таймингов
-        twai_timing_config_t mTimingConfig = {};
-        /// Конфигурация фильтра
-        twai_filter_config_t mFilterConfig = {};
+        // Указатели
+        esp32_c3::objects::Callback* mCallback = nullptr; ///< Callback-механизм
+
+        // Контейнеры
+        std::array<CanFilter, CAN_NUM_FILTER> mFilters; ///< Массив фильтров
+
+        // Пользовательские типы
+        twai_status_info_t mStatusInfo = {};      ///< Информация о состоянии
+        twai_general_config_t mDriverConfig = {}; ///< Конфигурация драйвера
+        twai_timing_config_t mTimingConfig = {};  ///< Конфигурация таймингов
+        twai_filter_config_t mFilterConfig = {};  ///< Конфигурация фильтра
+
+        // Синхронизация
+        mutable std::mutex mMutex; ///< Мьютекс для синхронизации
     };
-} // namespace hardware
+} // namespace can_bus
 
 #endif // HARDWARE_CAN_H

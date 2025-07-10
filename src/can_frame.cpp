@@ -1,16 +1,17 @@
 #include "canbus/can_frame.h"
+
 #include <cstring>
-#include <esp32-hal-log.h>
+#include <esp_log.h>
 
 namespace canbus
 {
-    CanFrame::CanFrame()
+    CanFrame::CanFrame() noexcept
     {
         clear();
-        log_d("CAN frame created");
+        ESP_LOGD(TAG, "CAN frame created");
     }
 
-    void CanFrame::clear()
+    void CanFrame::clear() noexcept
     {
         id = 0;
         length = 0;
@@ -18,60 +19,58 @@ namespace canbus
         rtr = 0;
         filterIndex = -1;
         memset(&data, 0, sizeof(data));
-        log_d("CAN frame cleared");
+        ESP_LOGD(TAG, "CAN frame cleared");
     }
 
-    bool CanFrame::hasData() const
+    bool CanFrame::hasData() const noexcept
     {
         return id > 0 && length > 0 && rtr == 0;
     }
 
-    uint16_t CanFrame::getWord(const int index) const
+    uint16_t CanFrame::getWord(const int index) const noexcept
     {
         if (index >= 0 && index + 1 < length)
         {
-            const uint16_t result = word(data.bytes[index], data.bytes[index + 1]);
-            log_d("Get word: %u", result);
+            const uint16_t result = (data.bytes[index] << 8) | data.bytes[index + 1];
+            ESP_LOGD(TAG, "Get word: %u", result);
             return result;
         }
-        log_w("Get word: index out of range");
+        ESP_LOGW(TAG, "Get word: index out of range");
         return 0;
     }
 
-    bool CanFrame::compare(const CanFrame& frame) const
+    bool CanFrame::compare(const CanFrame& frame) const noexcept
     {
-        if (frame.id != id || frame.length != length)
+        // Быстрая проверка наиболее вероятных различий
+        if (frame.id != id || frame.length != length ||
+            frame.extended != extended || frame.rtr != rtr)
         {
-            log_d("Compare: IDs or lengths differ");
+            ESP_LOGD(TAG, "Compare: header mismatch");
             return false;
         }
 
-        for (int i = 0; i < length; i++)
+        // Оптимизированное сравнение данных через memcmp
+        if (length > 0 && memcmp(frame.data.bytes, data.bytes, length) != 0)
         {
-            if (frame.data.bytes[i] != data.bytes[i])
-            {
-                log_d("Compare: data differs at position %d", i);
-                return false;
-            }
+            ESP_LOGD(TAG, "Compare: data mismatch");
+            return false;
         }
 
-        log_d("Compare: frames match");
         return true;
     }
 
-    Bytes CanFrame::getBytes(const int indexes[], const size_t size)
+    Bytes CanFrame::getBytes(const int indexes[], const size_t size) noexcept
     {
         Bytes result = {};
         for (size_t i = 0; i < size; i++)
         {
-            const int idx = indexes[i];
-            if (idx >= 0 && idx < 64)
+            if (const auto idx = indexes[i]; idx >= 0 && idx < 64)
             {
-                result.bit[i] = data.bit[idx];
+                result.bit[static_cast<uint8_t>(i)] = data.bit[idx];
             }
         }
 
-        log_d("Get bytes: %zu bits processed", size);
+        ESP_LOGD(TAG, "Get bytes: %zu bits processed", size);
         return result;
     }
-} // namespace hardware
+} // namespace canbus

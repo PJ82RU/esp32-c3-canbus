@@ -5,7 +5,7 @@
   "description": "High-performance CAN Bus library for ESP32-C3 with advanced filtering and callback support",
   "repository": {
     "type": "git",
-    "url": "https://github.com/PJ82RU/esp32-c3-canbus-arduino.git"
+    "url": "https://github.com/PJ82RU/esp32-c3-canbus.git"
   },
   "authors": [
     {
@@ -15,14 +15,16 @@
     }
   ],
   "license": "Unlicense",
-  "frameworks": "arduino",
+  "frameworks": [
+    "espidf",
+    "arduino"
+  ],
   "platforms": "espressif32",
   "headers": [
     "can_frame.h",
     "can.h"
   ],
   "dependencies": {
-    "arduino-libraries/Arduino-ESP32": ">=2.0.0",
     "PJ82RU/esp32-c3-utils": ">=1.0.0"
   }
 }
