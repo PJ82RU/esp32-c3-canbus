@@ -1,30 +1,116 @@
 #include "canbus/can.h"
 
 #include <algorithm>
+#include <cstring>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 
 namespace canbus
 {
-    Can::Can(gpio_num_t txPin, gpio_num_t rxPin) noexcept
-        : mWatchdogThread("CAN_WATCHDOG", 2048, 10),
-          mReceiveThread("CAN_RECEIVE", 4096, 19)
+    Can::Can(const gpio_num_t txPin, const gpio_num_t rxPin) noexcept
+        : mSendThread("CAN_SEND", STACK_DEPTH_SEND, 19),
+          mReceiveThread("CAN_RECEIVE", STACK_DEPTH_RECEIVE, 19),
+          mWatchdogThread("CAN_WATCHDOG", STACK_DEPTH_WATCHDOG, 10),
+          mSendQueue(MAX_QUEUE_SIZE),
+          mFilters(),
+          mFrameEntries(),
+          mDriverReady(false)
     {
         mDriverConfig = TWAI_GENERAL_CONFIG_DEFAULT(txPin, rxPin, TWAI_MODE_NORMAL);
+        mDriverConfig.rx_queue_len = RX_BUFFER_SIZE;
         mTimingConfig = TWAI_TIMING_CONFIG_125KBITS();
         mFilterConfig = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-        clearFilters();
     }
 
     Can::~Can() noexcept
     {
-        end();
+        stop();
     }
 
-    bool Can::installAndStartDriver() noexcept
+    void Can::bind(std::unique_ptr<FrameCallback> callback, ErrorFunction error)
     {
-        if (mDriverReady)
+        std::lock_guard lock(mMutex);
+        mDataCallback = std::move(callback);
+        mErrorCallback = std::move(error);
+    }
+
+    int16_t Can::bindFrameEntry(const FrameFunction& provider,
+                                const uint16_t intervalMs,
+                                const uint16_t sendCount,
+                                const bool active,
+                                const ErrorFunction& error)
+    {
+        std::lock_guard lock(mMutex);
+        if (mActiveFrameEntriesCount >= MAX_FRAMES)
+        {
+            ESP_LOGE(TAG, "Failed to add frame entry: buffer full (max %d entries)", MAX_FRAMES);
+            return -1;
+        }
+
+        mFrameEntries[mActiveFrameEntriesCount] = {
+            provider,
+            error,
+            intervalMs,
+            active ? (esp_timer_get_time() / 1000 + intervalMs) : static_cast<uint64_t>(0),
+            sendCount,
+            active
+        };
+
+        if (active)
+        {
+            ESP_LOGI(TAG, "Added periodic frame #%d: interval %ums, first send in %ums",
+                     mActiveFrameEntriesCount, intervalMs, intervalMs);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Added inactive frame entry #%d", mActiveFrameEntriesCount);
+        }
+
+        return mActiveFrameEntriesCount++;
+    }
+
+    bool Can::setFrameEntryActive(const int16_t index, const bool active) noexcept
+    {
+        std::lock_guard lock(mMutex);
+
+        // Проверка валидности индекса
+        if (index < 0 || index >= MAX_FRAMES || index >= mActiveFrameEntriesCount)
+        {
+            ESP_LOGE(TAG, "Invalid frame entry index: %d (max: %d)",
+                     index, mActiveFrameEntriesCount - 1);
+            return false;
+        }
+
+        // Проверка изменения состояния
+        if (mFrameEntries[index].isActive == active)
+        {
+            ESP_LOGW(TAG, "Frame entry %d already %s",
+                     index, active ? "active" : "inactive");
+            return true;
+        }
+
+        // Установка нового состояния
+        mFrameEntries[index].isActive = active;
+
+        // Сброс таймера при активации
+        if (active)
+        {
+            mFrameEntries[index].nextSendTime = esp_timer_get_time() / 1000 +
+                mFrameEntries[index].intervalMs;
+        }
+
+        ESP_LOGI(TAG, "Frame entry %d %s %s", index,
+                 (active ? "activated" : "deactivated"),
+                 (active ? ("next send in " + std::to_string(mFrameEntries[index].intervalMs) + "ms").c_str() : ""));
+
+        return true;
+    }
+
+    bool Can::installAndStartDriver() const noexcept
+    {
+        if (mDriverReady.load(std::memory_order_acquire))
         {
             ESP_LOGW(TAG, "Driver already installed");
             return true;
@@ -43,83 +129,107 @@ namespace canbus
             return false;
         }
 
-        mDriverReady = true;
+        mDriverReady.store(true, std::memory_order_release);
         ESP_LOGI(TAG, "TWAI driver started successfully");
         return true;
     }
 
-    void Can::stopAndUninstallDriver() noexcept
+    void Can::stopAndUninstallDriver() const noexcept
     {
-        if (!mDriverReady) return;
+        if (!mDriverReady.exchange(false)) return;
 
-        mDriverReady = false;
         twai_stop();
         vTaskDelay(pdMS_TO_TICKS(100));
         twai_driver_uninstall();
+
         ESP_LOGI(TAG, "TWAI driver stopped and uninstalled");
     }
 
-    bool Can::begin(esp32_c3::objects::Callback* callback) noexcept
+    bool Can::start(const CanSpeed speed)
     {
-        if (callback == nullptr) return false;
-
         std::lock_guard lock(mMutex);
-        bool result = false;
-
-        if (mDriverConfig.tx_io != GPIO_NUM_NC && mDriverConfig.rx_io != GPIO_NUM_NC)
+        if (!isInitialized() && mDriverConfig.tx_io != GPIO_NUM_NC && mDriverConfig.rx_io != GPIO_NUM_NC)
         {
-            if (mDriverReady) stopAndUninstallDriver();
+            setSpeed(speed);
 
-            setSpeed(mSpeed);
-            mCallback = callback;
-            result = installAndStartDriver() &&
-                mReceiveThread.start(&CanReceiveTask, this) &&
-                mWatchdogThread.start(&CanWatchdogTask, this);
-        }
-        else
-        {
-            ESP_LOGW(TAG, "Invalid GPIO configuration");
+            // Обработчик отправки сообщений
+            auto loopSend = [&]()
+            {
+                if (!mDriverReady.load(std::memory_order_acquire)) return esp32_c3::objects::Thread::LoopAction::STOP;
+                processSendQueue();
+                return esp32_c3::objects::Thread::LoopAction::CONTINUE;
+            };
+
+            // Обработчик приема сообщений
+            auto loopReceive = [&]()
+            {
+                if (!mDriverReady.load(std::memory_order_acquire)) return esp32_c3::objects::Thread::LoopAction::STOP;
+                processReceivedData();
+                return esp32_c3::objects::Thread::LoopAction::CONTINUE;
+            };
+
+            // Обработчик watchdog-таймера
+            auto loopWatchdog = [&]()
+            {
+                processWatchdog();
+                return esp32_c3::objects::Thread::LoopAction::CONTINUE;
+            };
+
+            return installAndStartDriver() &&
+                mSendThread.start(loopSend, SEND_INTERVAL_MS) &&
+                mReceiveThread.start(loopReceive, RECEIVE_INTERVAL_MS) &&
+                mWatchdogThread.start(loopWatchdog, WATCHDOG_INTERVAL_MS);
         }
 
-        return result;
+        ESP_LOGW(TAG, "Invalid GPIO configuration");
+        return false;
     }
 
-    void Can::end() noexcept
+    void Can::stop()
     {
         std::lock_guard lock(mMutex);
-
-        if (mDriverReady)
+        if (isInitialized())
         {
             mWatchdogThread.stop();
             mReceiveThread.stop();
+            mSendThread.stop();
+            if (!mSendQueue.reset())
+            {
+                ESP_LOGE(TAG, "Failed to reset send queue");
+            }
             stopAndUninstallDriver();
         }
     }
 
-    twai_state_t Can::getState() const noexcept
+    bool Can::isInitialized() const noexcept
     {
+        std::lock_guard lock(mMutex);
+        return mDriverReady.load(std::memory_order_acquire) &&
+            mSendThread.state() != esp32_c3::objects::Thread::State::NOT_RUNNING &&
+            mReceiveThread.state() != esp32_c3::objects::Thread::State::NOT_RUNNING &&
+            mWatchdogThread.state() != esp32_c3::objects::Thread::State::NOT_RUNNING;
+    }
+
+    twai_state_t Can::state() const noexcept
+    {
+        std::lock_guard lock(mMutex);
         return mStatusInfo.state;
     }
 
     bool Can::waitRunning(const uint32_t timeout) const noexcept
     {
+        std::lock_guard lock(mMutex);
         // Быстрая проверка без ожидания
-        if (mStatusInfo.state == TWAI_STATE_RUNNING)
-        {
-            return true;
-        }
+        if (mStatusInfo.state == TWAI_STATE_RUNNING) return true;
 
-        if (timeout == 0)
-        {
-            return false;
-        }
+        if (timeout == 0) return false;
 
         const TickType_t endTicks = xTaskGetTickCount() + pdMS_TO_TICKS(timeout);
-        constexpr TickType_t smallDelay = pdMS_TO_TICKS(5);
+        constexpr TickType_t checkInterval = pdMS_TO_TICKS(10);
 
         do
         {
-            vTaskDelay(smallDelay);
+            vTaskDelay(checkInterval);
             // ReSharper disable once CppDFAConstantConditions
             // ReSharper disable once CppDFAUnreachableCode
             if (mStatusInfo.state == TWAI_STATE_RUNNING) return true;
@@ -132,8 +242,6 @@ namespace canbus
     void Can::setSpeed(CanSpeed speed) noexcept
     {
         std::lock_guard lock(mMutex);
-        mSpeed = speed;
-
         switch (speed)
         {
         case CanSpeed::SPEED_25KBIT: mTimingConfig = TWAI_TIMING_CONFIG_25KBITS();
@@ -157,194 +265,210 @@ namespace canbus
         ESP_LOGI(TAG, "CAN speed set to %d kbit", static_cast<int>(speed));
     }
 
-    int8_t Can::setFilter(const uint8_t index,
-                          const uint32_t id,
-                          const uint32_t mask,
-                          const bool extended,
-                          const int16_t callbackIndex) noexcept
+    int16_t Can::setFilter(const uint32_t id,
+                           const uint32_t mask,
+                           const bool extended,
+                           const int16_t callbackIndex) noexcept
     {
-        if (index >= CAN_NUM_FILTER) return -1;
-
         std::lock_guard lock(mMutex);
-        mFilters[index] = {id & mask, mask, callbackIndex, true, extended};
-
-        ESP_LOGD(TAG, "Filter %u set: id=0x%08" PRIX32 ", mask=0x%08" PRIX32,
-                 static_cast<unsigned int>(index),
-                 id,
-                 mask);
-        return static_cast<int8_t>(index);
-    }
-
-    int8_t Can::setFilter(const uint32_t id,
-                          const uint32_t mask,
-                          const bool extended,
-                          const int16_t callbackIndex) noexcept
-    {
-        if (const auto it = std::ranges::find_if(mFilters, [](const CanFilter& f) { return !f.configured; }); it !=
-            mFilters.end())
+        if (mActiveFiltersCount >= MAX_FILTER_SIZE)
         {
-            return setFilter(std::distance(mFilters.begin(), it), id, mask, extended, callbackIndex);
+            ESP_LOGW(TAG, "No free filters available");
+            return -1;
         }
 
-        ESP_LOGW(TAG, "No free filters available");
-        return -1;
+        mFilters[mActiveFiltersCount] = {
+            id & mask,
+            mask,
+            callbackIndex,
+            true,
+            extended
+        };
+
+        return mActiveFiltersCount++;
     }
 
     CanFilter Can::getFilter(const int16_t index) const noexcept
     {
-        if (index >= 0 && index < static_cast<int16_t>(mFilters.size()))
-        {
-            return mFilters[index];
-        }
-        return CanFilter{};
+        std::lock_guard lock(mMutex);
+        return index >= 0 && index < MAX_FILTER_SIZE ? mFilters[index] : CanFilter();
     }
 
     void Can::clearFilters() noexcept
     {
         std::lock_guard lock(mMutex);
         mFilters.fill(CanFilter{});
-        ESP_LOGI(TAG, "Cleared %u filters", CAN_NUM_FILTER);
+        mActiveFiltersCount = 0;
+
+        ESP_LOGI(TAG, "Cleared %u filters", MAX_FILTER_SIZE);
     }
 
-    void Can::processFrame(const twai_message_t& message) const noexcept
+    esp_err_t Can::send(const CanFrame& frame)
     {
-        if (mCallback == nullptr) return;
-
-        CanFrame frame;
-        frame.id = message.identifier;
-        frame.length = message.data_length_code;
-        frame.rtr = message.rtr;
-        frame.extended = message.extd;
-        memcpy(frame.data.bytes, message.data, CAN_FRAME_DATA_SIZE);
-
-        for (size_t i = 0; i < mFilters.size(); ++i)
-        {
-            if (const auto& filter = mFilters[i]; filter.configured &&
-                (message.identifier & filter.mask) == filter.id &&
-                message.extd == filter.extended)
-            {
-                frame.filterIndex = static_cast<int8_t>(i);
-                mCallback->invoke(&frame, static_cast<int16_t>(i));
-                ESP_LOGD(TAG, "Frame 0x%08" PRIX32 " processed by filter %zu",
-                         message.identifier, i);
-                return;
-            }
-        }
-
-        // Обработка кадров без фильтра
-        frame.filterIndex = -1;
-        mCallback->invoke(&frame);
-        ESP_LOGD(TAG, "Frame 0x%08" PRIX32 " received (no filter)", message.identifier);
-    }
-
-    bool Can::send(CanFrame& frame) const noexcept
-    {
-        if (!frame.hasData())
-        {
-            ESP_LOGW(TAG, "Invalid frame data");
-            return false;
-        }
-
-        const uint32_t currentTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (frame.nextSendTime > currentTime)
-        {
-            ESP_LOGD(TAG, "Frame 0x%08" PRIX32 " send delayed", frame.id);
-            return false;
-        }
-
         std::lock_guard lock(mMutex);
 
-        if (!mDriverReady || mStatusInfo.state != TWAI_STATE_RUNNING)
+        // Валидация параметров
+        if (!isInitialized() || !frame.hasData())
+        {
+            ESP_LOGE(TAG, "Invalid send params: init=%d, len=%zu",
+                     mDriverReady.load(std::memory_order_acquire), frame.length);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        return mSendQueue.send(frame, 0) ? ESP_OK : ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t Can::sendImpl(const CanFrame& frame) const
+    {
+        if (!mDriverReady.load(std::memory_order_acquire) || mStatusInfo.state != TWAI_STATE_RUNNING)
         {
             ESP_LOGW(TAG, "CAN interface not ready");
-            return false;
+            return ESP_ERR_INVALID_STATE;
         }
 
-        if (frame.frequency != 0)
-        {
-            frame.nextSendTime = currentTime + frame.frequency;
-        }
-
-        // Полная инициализация структуры сообщения
-        twai_message_t message = {};
-        message.identifier = frame.id;
-        message.data_length_code = frame.length;
-
-        // Установка битовых флагов через анонимную структуру
-        message.extd = frame.extended ? 1 : 0;
-        message.rtr = frame.rtr ? 1 : 0;
-        message.ss = 0;           // Не используется для передачи
-        message.self = 0;         // Не используется для передачи
-        message.dlc_non_comp = 0; // Стандартный DLC
-        message.reserved = 0;     // Резервные биты
-
-        // Копируем данные, если это не RTR-фрейм
-        if (!frame.rtr && frame.length > 0)
-        {
-            memcpy(message.data, frame.data.bytes,
-                   (frame.length <= TWAI_FRAME_MAX_DLC) ? frame.length : TWAI_FRAME_MAX_DLC);
-        }
-
-        constexpr TickType_t sendTimeout = pdMS_TO_TICKS(CAN_SEND_MS_TO_TICKS);
+        const twai_message_t message = frame.getTwaiMessage();
+        constexpr TickType_t sendTimeout = pdMS_TO_TICKS(SEND_MS_TO_TICKS);
         const esp_err_t err = twai_transmit(&message, sendTimeout);
         if (err == ESP_OK)
         {
+            mStats.txFrames.fetch_add(1, std::memory_order_relaxed);
             ESP_LOGD(TAG, "Frame 0x%08" PRIX32 " sent successfully", frame.id);
-            return true;
+            return ESP_OK;
         }
 
+        mStats.errors.fetch_add(1, std::memory_order_relaxed);
         ESP_LOGW(TAG, "Failed to send frame 0x%08" PRIX32 ": %s",
                  frame.id, esp_err_to_name(err));
-        return false;
+        return err;
     }
 
-    bool Can::receive(CanFrame& frame) const noexcept
+    void Can::processSendQueue()
     {
-        return mCallback != nullptr && mCallback->read(&frame);
-    }
-
-    void Can::CanWatchdogTask(void* params)
-    {
-        if (auto* can = static_cast<Can*>(params)) can->handleWatchdog();
-        vTaskDelete(nullptr);
-    }
-
-    void Can::CanReceiveTask(void* params)
-    {
-        if (const auto* can = static_cast<Can*>(params)) can->handleReceive();
-        vTaskDelete(nullptr);
-    }
-
-    [[noreturn]] void Can::handleWatchdog() noexcept
-    {
-        constexpr TickType_t delay = 200 / portTICK_PERIOD_MS;
-        while (true)
+        // 1. Обработка очереди (срочные кадры)
+        if (!mSendQueue.empty())
         {
-            if (twai_get_status_info(&mStatusInfo) == ESP_OK &&
-                mStatusInfo.state == TWAI_STATE_BUS_OFF)
+            if (CanFrame frame; mSendQueue.receive(frame, 0))
             {
-                if (twai_initiate_recovery() != ESP_OK)
+                if (const esp_err_t ret = sendImpl(frame); ret == ESP_OK)
                 {
-                    ESP_LOGW(TAG, "Bus recovery failed");
+                    ESP_LOGV(TAG, "Frame 0x%03X sent successfully",
+                             static_cast<unsigned int>(frame.id));
+                }
+                else
+                {
+                    ESP_LOGV(TAG, "Failed to send frame 0x%03X, error: 0x%X (%s)",
+                             static_cast<unsigned int>(frame.id), ret, esp_err_to_name(ret));
+
+                    if (mErrorCallback) mErrorCallback(frame, ret);
                 }
             }
-            vTaskDelay(delay);
+            return;
+        }
+
+        // 2. Периодические кадры (если очередь пуста)
+        if (mActiveFrameEntriesCount == 0) return;
+
+        const uint64_t now = esp_timer_get_time() / 1000;
+        for (size_t i = 0; i < mActiveFrameEntriesCount; ++i)
+        {
+            const size_t index = (mLastProcessedEntryIndex + i) % mActiveFrameEntriesCount;
+            if (auto& entry = mFrameEntries[index]; entry.isActive && now >= entry.nextSendTime)
+            {
+                const CanFrame frame = entry.frameProvider();
+                if (const esp_err_t ret = sendImpl(frame); ret == ESP_OK)
+                {
+                    ESP_LOGV(TAG, "Periodic frame 0x%03X sent (next in %ums)",
+                             static_cast<unsigned int>(frame.id), entry.intervalMs);
+                }
+                else
+                {
+                    ESP_LOGV(TAG, "Periodic frame 0x%03X send failed: 0x%X (%s)",
+                             static_cast<unsigned int>(frame.id),
+                             ret,
+                             esp_err_to_name(ret));
+
+                    if (entry.errorProvider) entry.errorProvider(frame, ret);
+                }
+
+                entry.nextSendTime = now + entry.intervalMs;
+                mLastProcessedEntryIndex = static_cast<int16_t>((index + 1) % mActiveFrameEntriesCount);
+                break;
+            }
         }
     }
 
-    [[noreturn]] void Can::handleReceive() const noexcept
+    void Can::processReceivedData() noexcept
     {
-        while (true)
+        twai_message_t message;
+        if (!mDataCallback)
         {
-            if (mDriverReady)
+            // Сбрасываем очередь при отсутствии обработчика
+            while (twai_receive(&message, 0) == ESP_OK)
             {
-                twai_message_t message;
-                if (twai_receive(&message, pdMS_TO_TICKS(CAN_RECEIVE_MS_TO_TICKS)) == ESP_OK)
+            }
+            return;
+        }
+
+        auto response = [&](const CanFrame& result)
+        {
+            send(result);
+        };
+
+        while (twai_receive(&message, 0) == ESP_OK)
+        {
+            CanFrame frame(message);
+            bool processed = false;
+
+            for (size_t i = 0; i < mActiveFiltersCount; ++i)
+            {
+                if (const auto& filter = mFilters[i]; filter.configured &&
+                    (frame.id & filter.mask) == filter.id &&
+                    frame.extended == filter.extended)
                 {
-                    processFrame(message);
+                    mDataCallback->invoke(frame, response, static_cast<int16_t>(i));
+                    ESP_LOGD(TAG, "Frame 0x%08" PRIX32 " processed by filter %zu",
+                             message.identifier, i);
+                    processed = true;
+                    break;
                 }
-                vTaskDelay(pdMS_TO_TICKS(CAN_RECEIVE_MS_TO_TICKS));
+            }
+
+            // Обработка кадров без фильтра
+            if (!processed)
+            {
+                mDataCallback->invoke(frame, response);
+                ESP_LOGD(TAG, "Frame 0x%08" PRIX32 " received (no filter)", message.identifier);
+            }
+
+            mStats.rxFrames.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void Can::processWatchdog()
+    {
+        if (twai_get_status_info(&mStatusInfo) == ESP_OK &&
+            mStatusInfo.state == TWAI_STATE_BUS_OFF)
+        {
+            if (twai_initiate_recovery() != ESP_OK)
+            {
+                ESP_LOGW(TAG, "Bus recovery failed");
             }
         }
+    }
+
+    size_t Can::getQueueSize() const
+    {
+        return mSendQueue.waiting();
+    }
+
+    size_t Can::clearQueue()
+    {
+        size_t count = 0;
+        CanFrame frame;
+        while (mSendQueue.receive(frame, 0))
+        {
+            count++;
+        }
+        return count;
     }
 } // namespace canbus

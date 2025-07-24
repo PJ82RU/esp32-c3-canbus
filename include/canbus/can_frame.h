@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <hal/twai_types.h>
 
 namespace canbus
 {
@@ -55,6 +56,8 @@ namespace canbus
 
     /**
      * @brief Объединение для работы с данными CAN-фрейма
+     * @details Позволяет интерпретировать данные фрейма различными способами:
+     * как целые числа разной разрядности, массивы чисел или отдельные биты
      */
     union Bytes
     {
@@ -79,6 +82,7 @@ namespace canbus
              * @brief Оператор чтения бита
              * @param[in] pos Позиция бита (0-63)
              * @return Значение бита
+             * @note Для недопустимых позиций возвращает false
              */
             bool operator[](const int pos) const noexcept
             {
@@ -89,6 +93,7 @@ namespace canbus
              * @brief Оператор записи бита
              * @param[in] pos Позиция бита (0-63)
              * @return Ссылка на бит
+             * @note Для недопустимых позиций возвращает ссылку на первый бит
              */
             BitRef operator[](const int pos) noexcept
             {
@@ -99,6 +104,8 @@ namespace canbus
 
     /**
      * @brief Класс CAN-фрейма
+     * @details Представляет CAN-сообщение с идентификатором, флагами и данными.
+     * Поддерживает как стандартные (11-битные), так и расширенные (29-битные) идентификаторы.
      */
     class CanFrame
     {
@@ -108,23 +115,37 @@ namespace canbus
 
         /**
          * @brief Конструктор по умолчанию
+         * @details Создает пустой CAN-фрейм с нулевыми значениями всех полей
          */
         CanFrame() noexcept;
 
         /**
+         * @brief Конструктор из структуры twai_message_t
+         * @param[in] msg Сообщение в формате TWAI
+         */
+        explicit CanFrame(const twai_message_t& msg);
+
+        /**
          * @brief Очистка фрейма
+         * @details Устанавливает все поля фрейма в нулевые значения
          */
         void clear() noexcept;
 
         /**
          * @brief Проверка наличия данных
-         * @return true если фрейм содержит данные
+         * @return true если фрейм содержит данные (length > 0)
          */
         [[nodiscard]] bool hasData() const noexcept;
 
         /**
+         * @brief Преобразует CAN-фрейм в структуру TWAI сообщения
+         * @return twai_message_t Готовая структура сообщения для передачи через TWAI драйвер
+         */
+        [[nodiscard]] twai_message_t getTwaiMessage() const;
+
+        /**
          * @brief Получение 16-битного значения
-         * @param[in] index Начальный индекс в массиве данных
+         * @param[in] index Начальный индекс в массиве данных (0-6)
          * @return 16-битное значение
          */
         [[nodiscard]] uint16_t getWord(int index) const noexcept;
@@ -132,7 +153,7 @@ namespace canbus
         /**
          * @brief Сравнение фреймов
          * @param[in] frame Фрейм для сравнения
-         * @return true если фреймы идентичны
+         * @return true если фреймы идентичны (совпадают все поля)
          */
         [[nodiscard]] bool compare(const CanFrame& frame) const noexcept;
 
@@ -144,17 +165,11 @@ namespace canbus
          */
         Bytes getBytes(const int indexes[], size_t size) noexcept;
 
-        uint32_t id = 0;                     ///< 11- или 29-битный идентификатор
-        Bytes data{};                        ///< Данные фрейма
-        uint8_t length = 0;                  ///< Длина данных (0-8)
-        uint32_t extended = 0;               ///< Флаг расширенного формата (29 бит)
-        uint32_t rtr = 0;                    ///< Флаг удаленного запроса
-        int8_t filterIndex = -1;             ///< Индекс фильтра
-        uint16_t frequency = CAN_FRAME_FREQ; ///< Частота отправки (мс)
-        unsigned long nextSendTime = 0;      ///< Время следующей отправки (мс)
-
-    private:
-        // Приватные методы (если будут добавлены в будущем)
+        uint32_t id = 0;       ///< 11- или 29-битный идентификатор
+        Bytes data{};          ///< Данные фрейма (до 8 байт)
+        uint8_t length = 0;    ///< Длина данных (0-8)
+        bool extended = false; ///< Флаг расширенного формата (29 бит)
+        bool rtr = false;      ///< Флаг удаленного запроса (Remote Transmission Request)
     };
 } // namespace canbus
 

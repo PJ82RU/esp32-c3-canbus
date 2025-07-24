@@ -12,14 +12,6 @@
 namespace canbus
 {
     /**
-     * @brief Константы CAN-интерфейса
-     */
-    constexpr uint8_t CAN_NUM_FILTER = 32;            ///< Количество фильтров
-    constexpr uint8_t CAN_RX_BUFFER_SIZE = 64;        ///< Размер буфера приема
-    constexpr uint16_t CAN_RECEIVE_MS_TO_TICKS = 100; ///< Таймаут приема (мс)
-    constexpr uint16_t CAN_SEND_MS_TO_TICKS = 4;      ///< Таймаут отправки (мс)
-
-    /**
      * @brief Скорости CAN-шины
      */
     enum class CanSpeed
@@ -55,6 +47,26 @@ namespace canbus
         /// @brief Тег для логирования
         static constexpr auto TAG = "Can";
 
+        static constexpr uint32_t STACK_DEPTH_SEND = 2560;
+        static constexpr uint32_t STACK_DEPTH_RECEIVE = 3072;
+        static constexpr uint32_t STACK_DEPTH_WATCHDOG = 1536;
+
+        static constexpr uint8_t RX_BUFFER_SIZE = 32;   ///< Размер буфера приема
+        static constexpr uint16_t SEND_MS_TO_TICKS = 4; ///< Таймаут отправки (мс)
+
+        static constexpr uint8_t MAX_FILTER_SIZE = 32; ///< Количество фильтров
+        static constexpr size_t MAX_QUEUE_SIZE = 16;   ///< Максимальный размер очереди отправки
+        static constexpr size_t MAX_FRAMES = 32;       ///< Фиксированный лимит
+
+        static constexpr uint16_t SEND_INTERVAL_MS = 50;      ///< Таймаут отправки (мс)
+        static constexpr uint16_t RECEIVE_INTERVAL_MS = 50;   ///< Таймаут приема (мс)
+        static constexpr uint16_t WATCHDOG_INTERVAL_MS = 200; ///< Таймаут Watchdog (мс)
+
+        using FrameCallback = esp32_c3::objects::Callback<CanFrame>;
+        using ErrorFunction = std::function<void(const CanFrame& frame, esp_err_t ret)>;
+        using FrameQueue = esp32_c3::objects::BufferedQueue<CanFrame, MAX_QUEUE_SIZE>;
+        using FrameFunction = std::function<CanFrame()>;
+
         /**
          * @brief Конструктор
          * @param txPin Пин TX
@@ -72,22 +84,57 @@ namespace canbus
         Can& operator=(const Can&) = delete;
 
         /**
-         * @brief Инициализация CAN-интерфейса
-         * @param callback Функция обратного вызова
-         * @return true если инициализация прошла успешно
+         * @brief Привязать callback для обработки входящих данных
+         * @param callback Уникальный указатель на callback для входящих данных
+         * @param error Уникальный указатель на callback для ошибок отправки
          */
-        bool begin(esp32_c3::objects::Callback* callback) noexcept;
+        void bind(std::unique_ptr<FrameCallback> callback, ErrorFunction error = nullptr);
 
         /**
-         * @brief Деинициализация CAN-интерфейса
+         * @brief Привязывает функцию-генератор CAN-фрейма для периодической отправки
+         * @param provider Функция, возвращающая CAN-фрейм для отправки
+         * @param intervalMs Интервал отправки в миллисекундах
+         * @param sendCount Количество отправок (0 - бесконечно)
+         * @param active Флаг активности (true - включить отправку, false - выключить)
+         * @param error Функция обработки ошибок отправки
+         * @return Индекс созданной записи или -1 при ошибке
          */
-        void end() noexcept;
+        int16_t bindFrameEntry(const FrameFunction& provider,
+                               uint16_t intervalMs,
+                               uint16_t sendCount = 0,
+                               bool active = true,
+                               const ErrorFunction& error = nullptr);
+
+        /**
+         * @brief Устанавливает активность периодической отправки фрейма
+         * @param index Индекс записи в mFrameEntries
+         * @param active Флаг активности (true - включить отправку, false - выключить)
+         * @return true если изменение прошло успешно, false при неверном индексе
+         */
+        bool setFrameEntryActive(int16_t index, bool active) noexcept;
+
+        /**
+         * @brief Запуск/проверка рабочего потока CAN-интерфейса
+         * @return true если поток успешно запущен или уже работает
+         */
+        bool start(CanSpeed speed = CanSpeed::SPEED_125KBIT);
+
+        /**
+         * @brief Остановка рабочего потока CAN-интерфейса
+         */
+        void stop();
+
+        /**
+         * @brief Проверить, инициализирован ли CAN-интерфейс
+         * @return bool true если инициализирован
+         */
+        [[nodiscard]] bool isInitialized() const noexcept;
 
         /**
          * @brief Получить текущее состояние CAN-интерфейса
          * @return Состояние интерфейса
          */
-        twai_state_t getState() const noexcept;
+        [[nodiscard]] twai_state_t state() const noexcept;
 
         /**
          * @brief Ожидание перехода в рабочее состояние
@@ -103,17 +150,6 @@ namespace canbus
         void setSpeed(CanSpeed speed) noexcept;
 
         /**
-         * @brief Установка фильтра
-         * @param index Индекс фильтра
-         * @param id Идентификатор
-         * @param mask Маска
-         * @param extended Флаг расширенного формата
-         * @param callbackIndex Индекс callback-функции
-         * @return Индекс установленного фильтра или -1 при ошибке
-         */
-        int8_t setFilter(uint8_t index, uint32_t id, uint32_t mask, bool extended, int16_t callbackIndex = -1) noexcept;
-
-        /**
          * @brief Установка фильтра (автовыбор индекса)
          * @param id Идентификатор
          * @param mask Маска
@@ -121,14 +157,14 @@ namespace canbus
          * @param callbackIndex Индекс callback-функции
          * @return Индекс установленного фильтра или -1 при ошибке
          */
-        int8_t setFilter(uint32_t id, uint32_t mask, bool extended, int16_t callbackIndex = -1) noexcept;
+        [[nodiscard]] int16_t setFilter(uint32_t id, uint32_t mask, bool extended, int16_t callbackIndex = -1) noexcept;
 
         /**
          * @brief Получить параметры фильтра
          * @param index Индекс фильтра
          * @return Структура с параметрами фильтра
          */
-        CanFilter getFilter(int16_t index) const noexcept;
+        [[nodiscard]] CanFilter getFilter(int16_t index) const noexcept;
 
         /**
          * @brief Очистить все фильтры
@@ -136,87 +172,104 @@ namespace canbus
         void clearFilters() noexcept;
 
         /**
-         * @brief Отправить CAN-кадр
+         * @brief Добавить CAN-кадр в очередь отправки (потокобезопасно)
          * @param frame CAN-кадр для отправки
-         * @return true если отправка прошла успешно
+         * @return esp_err_t ESP_OK при успешном добавлении в очередь
          */
-        bool send(CanFrame& frame) const noexcept;
+        esp_err_t send(const CanFrame& frame);
 
         /**
-         * @brief Получить CAN-кадр из буфера
-         * @param frame CAN-кадр для заполнения
-         * @return true если кадр получен
+         * @brief Получить текущий размер очереди отправки
+         * @return size_t Количество пакетов в очереди
          */
-        bool receive(CanFrame& frame) const noexcept;
+        [[nodiscard]] size_t getQueueSize() const;
+
+        /**
+         * @brief Очистить очередь отправки
+         * @return size_t Количество удалённых пакетов
+         */
+        size_t clearQueue();
+
+        struct
+        {
+            mutable std::atomic<uint32_t> txFrames{0};
+            mutable std::atomic<uint32_t> rxFrames{0};
+            mutable std::atomic<uint32_t> errors{0};
+        } mStats;
 
     protected:
         /**
-         * @brief Задача мониторинга состояния CAN-интерфейса (watchdog)
-         * @details Бесконечно проверяет состояние шины, инициирует восстановление
-         *          при переходе в состояние BUS_OFF
-         * @param params Указатель на экземпляр класса Can (this)
+         * @brief Структура для хранения информации о периодически отправляемых CAN-фреймах
          */
-        static void CanWatchdogTask(void* params);
+        struct FrameEntry
+        {
+            FrameFunction frameProvider; ///< Функция-генератор CAN-фрейма
+            ErrorFunction errorProvider; ///< Функция обработки ошибок отправки
+            uint16_t intervalMs;         ///< Интервал отправки в миллисекундах
+            uint64_t nextSendTime;       ///< Время следующей отправки, мс
+            uint16_t remainingSends;     ///< Оставшееся количество отправок (0 - бесконечно)
+            bool isActive;               ///< Флаг активности записи
+        };
 
-        /**
-         * @brief Задача приема сообщений с CAN-шины
-         * @details Бесконечно обрабатывает входящие сообщения, применяя фильтрацию
-         *          и передавая данные через callback-механизм
-         * @param params Указатель на экземпляр класса Can (this)
-         */
-        static void CanReceiveTask(void* params);
-
-        /**
-         * @brief Обработчик watchdog-таймера
-         */
-        [[noreturn]] void handleWatchdog() noexcept;
-
-        /**
-         * @brief Обработчик приема сообщений
-         * @return true если интерфейс готов к работе
-         */
-        [[noreturn]] void handleReceive() const noexcept;
-
-    private:
         /**
          * @brief Установка и запуск драйвера TWAI
          * @return true если операция выполнена успешно
          */
-        bool installAndStartDriver() noexcept;
+        bool installAndStartDriver() const noexcept;
 
         /**
          * @brief Остановка и удаление драйвера TWAI
          */
-        void stopAndUninstallDriver() noexcept;
+        void stopAndUninstallDriver() const noexcept;
+
+        /**
+         * @brief Внутренняя реализация отправки CAN-кадра
+         * @param frame CAN-кадр для отправки
+         * @return esp_err_t Результат отправки
+         */
+        [[nodiscard]] esp_err_t sendImpl(const CanFrame& frame) const;
+
+        /**
+         * @brief Обработать очередь отправки
+         * @note Отправляет не чаще чем раз в SEND_INTERVAL_US
+         */
+        void processSendQueue();
 
         /**
          * @brief Обработка входящего сообщения
-         * @param message Входящее сообщение
          */
-        void processFrame(const twai_message_t& message) const noexcept;
+        void processReceivedData() noexcept;
 
-        // Потоки
-        esp32_c3::objects::Thread mWatchdogThread; ///< Поток мониторинга состояния
+        /**
+         * @brief Мониторинг состояния CAN-шины и восстановление после ошибок
+         */
+        void processWatchdog();
+
+        mutable std::recursive_mutex mMutex;       ///< Мьютекс для потокобезопасности
+        esp32_c3::objects::Thread mSendThread;     ///< Поток отправки сообщений
         esp32_c3::objects::Thread mReceiveThread;  ///< Поток приема сообщений
+        esp32_c3::objects::Thread mWatchdogThread; ///< Поток мониторинга состояния
 
-        // Примитивные типы
-        bool mDriverReady = false;                 ///< Флаг готовности драйвера
-        CanSpeed mSpeed = CanSpeed::SPEED_125KBIT; ///< Текущая скорость
+        std::unique_ptr<FrameCallback> mDataCallback; ///< Callback для данных
+        ErrorFunction mErrorCallback;                 ///< Callback для ошибок отправки
+        FrameQueue mSendQueue;                        ///< Очередь пакетов на отправку
 
-        // Указатели
-        esp32_c3::objects::Callback* mCallback = nullptr; ///< Callback-механизм
+        std::array<CanFilter, MAX_FILTER_SIZE> mFilters; ///< Массив фильтров для входящих сообщений
+        int16_t mActiveFiltersCount = 0;                 ///< Текущее количество активных фильтров
 
-        // Контейнеры
-        std::array<CanFilter, CAN_NUM_FILTER> mFilters; ///< Массив фильтров
+        std::array<FrameEntry, MAX_FRAMES> mFrameEntries; ///< Массив записей периодических отправок
+        int16_t mActiveFrameEntriesCount = 0; ///< Текущее количество активных записей периодических отправок
+        int16_t mLastProcessedEntryIndex = 0; ///< Индекс последней обработанной записи (для round-robin)
 
-        // Пользовательские типы
         twai_status_info_t mStatusInfo = {};      ///< Информация о состоянии
         twai_general_config_t mDriverConfig = {}; ///< Конфигурация драйвера
         twai_timing_config_t mTimingConfig = {};  ///< Конфигурация таймингов
         twai_filter_config_t mFilterConfig = {};  ///< Конфигурация фильтра
 
-        // Синхронизация
-        mutable std::mutex mMutex; ///< Мьютекс для синхронизации
+        uint64_t mNextSendTime = 0; ///< Время следующей отправки (мкс)
+
+    private:
+        mutable std::atomic<bool> mDriverReady; ///< Флаг готовности драйвера
     };
 } // namespace can_bus
 
