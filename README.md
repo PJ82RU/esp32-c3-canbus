@@ -42,12 +42,7 @@ canbus::Can can(GPIO_NUM_5, GPIO_NUM_6);
 void app_main() {
     // Настройка callback для приема сообщений
     auto callback = std::make_unique<esp32_c3::objects::Callback<canbus::CanFrame>>(
-        "CAN_RX_CALLBACK",
-        5,
-        10,
-        8192,
-        18
-    );
+        "CAN_RX_CALLBACK", 5, 10);
     callback->addCallback(...)
     can.bind(std::move(callback));
     
