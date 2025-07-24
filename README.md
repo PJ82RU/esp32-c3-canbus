@@ -41,8 +41,15 @@ canbus::Can can(GPIO_NUM_5, GPIO_NUM_6);
 
 void app_main() {
     // Настройка callback для приема сообщений
-    can.bind(std::make_unique<esp32_c3::objects::Callback<canbus::CanFrame>>(
-        "CAN_Callback", 5, 10, 3072, 18));
+    auto callback = std::make_unique<esp32_c3::objects::Callback<canbus::CanFrame>>(
+        "CAN_RX_CALLBACK",
+        5,
+        10,
+        8192,
+        18
+    );
+    callback->addCallback(...)
+    can.bind(std::move(callback));
     
     // Запуск CAN на скорости 500 kbit/s
     can.start(canbus::CanSpeed::SPEED_500KBIT);
