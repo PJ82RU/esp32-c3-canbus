@@ -36,10 +36,10 @@ lib_deps =
 ```cpp
 #include "canbus/can.h"
 
+// Инициализация CAN (TX: GPIO5, RX: GPIO6)
+canbus::Can can(GPIO_NUM_5, GPIO_NUM_6);
+
 void app_main() {
-    // Инициализация CAN (TX: GPIO5, RX: GPIO6)
-    canbus::Can can(GPIO_NUM_5, GPIO_NUM_6);
-    
     // Настройка callback для приема сообщений
     can.bind(std::make_unique<esp32_c3::objects::Callback<canbus::CanFrame>>(
         "CAN_Callback", 5, 10, 3072, 18));
